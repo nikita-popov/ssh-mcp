@@ -25,16 +25,50 @@ import (
 )
 
 const (
-	version     = "1.1.1"
+	version     = "1.2.0"
 	dialTimeout = 15 * time.Second
-	// Kept below lazy-mcp's exec_timeout (60s) so the caller sees a clear
-	// "command timed out after 45s" instead of an opaque proxy-side
-	// "context deadline exceeded" with the command still running.
-	defaultTimeout   = 45 * time.Second
-	maxTimeout       = 30 * time.Minute
+	// hardTimeout is an absolute ceiling: SSH_MCP_MAX_TIMEOUT may lower the
+	// per-call limit but can never raise it past this.
+	hardTimeout      = 30 * time.Minute
 	defaultMaxOutput = 256 * 1024
 	maxMaxOutput     = 4 * 1024 * 1024
 )
+
+// defaultTimeout is the effective per-call ceiling for ssh_exec, and the
+// default when the caller omits timeout_seconds.
+//
+// The stock 45s sits below lazy-mcp's exec_timeout (60s) on purpose: the
+// caller then gets our own "command timed out after 45s" text with the remote
+// process really SIGTERM'd and SIGKILL'd, instead of the proxy's opaque
+// "context deadline exceeded" - which abandons the call while the command
+// keeps running as an orphan. Raising SSH_MCP_MAX_TIMEOUT above the proxy's
+// exec_timeout reintroduces exactly that failure mode: raise exec_timeout
+// first, then this.
+var defaultTimeout = envTimeout("SSH_MCP_MAX_TIMEOUT", 45*time.Second)
+
+// timeoutSeconds is the per-call ceiling in whole seconds, as advertised in
+// the tool schema and instructions.
+func timeoutSeconds() int { return int(defaultTimeout / time.Second) }
+
+// envTimeout reads a positive integer number of seconds from name, falling
+// back to def when unset, malformed, or above the hard cap.
+func envTimeout(name string, def time.Duration) time.Duration {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return def
+	}
+	secs, err := strconv.Atoi(raw)
+	if err != nil || secs <= 0 {
+		warnf("%s=%q is not a positive number of seconds, using %s", name, raw, def)
+		return def
+	}
+	d := time.Duration(secs) * time.Second
+	if d > hardTimeout {
+		warnf("%s=%ds exceeds the %s hard cap, clamping", name, secs, hardTimeout)
+		return hardTimeout
+	}
+	return d
+}
 
 type Request struct {
 	JSONRPC string          `json:"jsonrpc"`
@@ -216,7 +250,7 @@ func handleRequest(req *Request) *Response {
 				ProtocolVersion: pv,
 				Capabilities:    Capabilities{Tools: &ToolsCapability{}},
 				ServerInfo:      ServerInfo{Name: "ssh-mcp", Version: version},
-				Instructions:    "Runs one shell command per ssh_exec call. A non-zero remote exit code is reported as exit_code in the text (not as a tool error); tool errors mean the SSH transport itself failed. Output is capped at max_output_bytes (default 256 KiB, head+tail kept) - narrow with grep/head instead of dumping.",
+				Instructions:    fmt.Sprintf("Runs one shell command per ssh_exec call. A non-zero remote exit code is reported as exit_code in the text (not as a tool error); tool errors mean the SSH transport itself failed. Output is capped at max_output_bytes (default 256 KiB, head+tail kept) - narrow with grep/head instead of dumping. Each call has a hard timeout ceiling of %ds (SSH_MCP_MAX_TIMEOUT); asking for more is clamped, not honoured.", timeoutSeconds()),
 			},
 		}
 
@@ -257,13 +291,17 @@ func handleRequest(req *Request) *Response {
 func toolCatalog() []Tool {
 	hostProp := Property{Type: "string", Description: "SSH target: user@host, user@host:port, or an alias from ~/.ssh/config"}
 	passProp := Property{Type: "string", Description: "Password (optional). Prefer keys or SSH_AUTH_SOCK - never send a password unless the host really needs one"}
-	timeoutProp := Property{Type: "number", Description: "Hard wall-clock limit for the whole call, seconds. The session is killed on expiry.", Default: int(defaultTimeout / time.Second)}
+	timeoutProp := Property{
+		Type:        "number",
+		Description: fmt.Sprintf("Hard wall-clock limit for the whole call, seconds. Default and max are both %d - the ceiling is whatever the server allows via SSH_MCP_MAX_TIMEOUT, and a larger value is clamped, not honoured. On expiry the remote process gets SIGTERM, then SIGKILL 2s later.", timeoutSeconds()),
+		Default:     timeoutSeconds(),
+	}
 	maxOutProp := Property{Type: "number", Description: "Max bytes of combined stdout+stderr kept (head+tail).", Default: defaultMaxOutput}
 
 	return []Tool{
 		{
 			Name:        "ssh_exec",
-			Description: "Execute a command on a remote host via SSH. Returns exit_code, duration, stdout and stderr. Non-zero exit is NOT a tool error.",
+			Description: fmt.Sprintf("Execute a command on a remote host via SSH. Returns exit_code, duration, stdout and stderr. Non-zero exit is NOT a tool error. Per-call timeout ceiling: %ds (server-side SSH_MCP_MAX_TIMEOUT) - a larger timeout_seconds is clamped, not honoured.", timeoutSeconds()),
 			InputSchema: InputSchema{
 				Type: "object",
 				Properties: map[string]Property{
@@ -331,7 +369,7 @@ func handleExec(id any, params *CallToolParams) *Response {
 		return toolError(id, "Missing host or command")
 	}
 
-	timeout := durArg(params, "timeout_seconds", defaultTimeout, maxTimeout)
+	timeout := durArg(params, "timeout_seconds", defaultTimeout, defaultTimeout)
 	maxOut := intArg(params, "max_output_bytes", defaultMaxOutput, maxMaxOutput)
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)

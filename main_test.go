@@ -154,3 +154,87 @@ func TestNotificationsAreNotAnswered(t *testing.T) {
 		t.Fatalf("unknown notification answered: %+v", resp)
 	}
 }
+
+// TestEnvTimeout covers SSH_MCP_MAX_TIMEOUT parsing: unset, valid, malformed,
+// non-positive and above the hard cap. A bad value must degrade to the stock
+// default rather than to zero (zero would mean "no timeout at all").
+func TestEnvTimeout(t *testing.T) {
+	const name = "SSH_MCP_MAX_TIMEOUT_TEST"
+	cases := []struct {
+		raw  string
+		want time.Duration
+	}{
+		{"", 45 * time.Second},
+		{"90", 90 * time.Second},
+		{"1", time.Second},
+		{"0", 45 * time.Second},
+		{"-5", 45 * time.Second},
+		{"abc", 45 * time.Second},
+		{" 120 ", 120 * time.Second},
+		{"999999", hardTimeout},
+	}
+	for _, c := range cases {
+		t.Setenv(name, c.raw)
+		if got := envTimeout(name, 45*time.Second); got != c.want {
+			t.Errorf("envTimeout(%q) = %s, want %s", c.raw, got, c.want)
+		}
+	}
+}
+
+// TestSchemaAdvertisesEffectiveTimeout guards the promise that the advertised
+// ceiling is the real one, not a hardcoded literal: a caller that only reads
+// tools/list or the initialize instructions must be able to see what the
+// operator actually allowed, otherwise it asks for 300s, gets silently clamped
+// and the proxy kills the call first.
+func TestSchemaAdvertisesEffectiveTimeout(t *testing.T) {
+	old := defaultTimeout
+	defer func() { defaultTimeout = old }()
+	defaultTimeout = 55 * time.Second
+
+	found := false
+	for _, tool := range toolCatalog() {
+		if tool.Name != "ssh_exec" {
+			continue
+		}
+		found = true
+		if !strings.Contains(tool.Description, "55s") {
+			t.Errorf("ssh_exec description does not advertise the 55s ceiling: %s", tool.Description)
+		}
+		p := tool.InputSchema.Properties["timeout_seconds"]
+		if p.Default != 55 {
+			t.Errorf("timeout_seconds default = %v, want 55", p.Default)
+		}
+		if !strings.Contains(p.Description, "55") {
+			t.Errorf("timeout_seconds description does not advertise 55: %s", p.Description)
+		}
+	}
+	if !found {
+		t.Fatal("ssh_exec missing from catalog")
+	}
+
+	resp := handleRequest(&Request{JSONRPC: "2.0", ID: 1, Method: "initialize"})
+	if resp == nil {
+		t.Fatal("initialize returned nil")
+	}
+	res, ok := resp.Result.(InitializeResult)
+	if !ok {
+		t.Fatalf("unexpected initialize result type %T", resp.Result)
+	}
+	if !strings.Contains(res.Instructions, "55s") {
+		t.Errorf("instructions do not advertise the 55s ceiling: %s", res.Instructions)
+	}
+}
+
+// TestExecTimeoutClampedToCeiling: a request above the operator's ceiling must
+// come back as the ceiling. Honouring 600s while the proxy gives up at 60s is
+// what produced orphaned remote processes.
+func TestExecTimeoutClampedToCeiling(t *testing.T) {
+	old := defaultTimeout
+	defer func() { defaultTimeout = old }()
+	defaultTimeout = 45 * time.Second
+
+	p := &CallToolParams{Arguments: map[string]any{"timeout_seconds": float64(600)}}
+	if got := durArg(p, "timeout_seconds", defaultTimeout, defaultTimeout); got != 45*time.Second {
+		t.Errorf("got %s, want 45s", got)
+	}
+}
