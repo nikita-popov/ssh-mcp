@@ -1,6 +1,7 @@
 package main
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -74,6 +75,50 @@ func TestParseHostSSHConfig(t *testing.T) {
 	_, addr, _ = parseHost("bob@db:2200")
 	if addr != "10.0.0.5:2200" {
 		t.Errorf("addr = %q, want 10.0.0.5:2200", addr)
+	}
+
+	// An explicit user on the command line wins over User in the config.
+	// Regression: the config used to overwrite it unconditionally, so
+	// "root@db" silently ran as postgres.
+	if user, _, _ = parseHost("bob@db"); user != "bob" {
+		t.Errorf("explicit user = %q, want bob", user)
+	}
+	if user, _, _ = parseHost("bob@db:2200"); user != "bob" {
+		t.Errorf("explicit user with port = %q, want bob", user)
+	}
+	// Without an explicit user the config still applies.
+	if user, _, _ = parseHost("db"); user != "postgres" {
+		t.Errorf("config user = %q, want postgres", user)
+	}
+}
+
+// TestServeStreamFlushesOnEOF guards the bug where closing stdin made the
+// server exit before goroutine-served requests could write their response:
+// `ssh-mcp < requests.jsonl` produced zero output.
+func TestServeStreamFlushesOnEOF(t *testing.T) {
+	init := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}`
+	list := `{"jsonrpc":"2.0","id":2,"method":"tools/list"}`
+	input := strings.NewReader(init + "\n" + list + "\n")
+
+	old := os.Stdout
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = pw
+	serveStream(input)
+	pw.Close()
+	os.Stdout = old
+
+	out, err := io.ReadAll(pr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out), `"id":2`) {
+		t.Fatalf("response for id=2 missing after EOF; got %d bytes: %.200s", len(out), out)
+	}
+	if strings.Count(string(out), `"jsonrpc"`) != 2 {
+		t.Fatalf("want 2 responses, got: %s", out)
 	}
 }
 

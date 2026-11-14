@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"os"
+	osuser "os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -24,7 +25,7 @@ import (
 )
 
 const (
-	version     = "1.1.0"
+	version     = "1.1.1"
 	dialTimeout = 15 * time.Second
 	// Kept below lazy-mcp's exec_timeout (60s) so the caller sees a clear
 	// "command timed out after 45s" instead of an opaque proxy-side
@@ -127,19 +128,36 @@ func warnf(format string, a ...any) {
 }
 
 func main() {
+	serveStream(os.Stdin)
+}
+
+// serveStream reads JSON-RPC lines from in until EOF, serving each in its own
+// goroutine, and does not return until every in-flight request has answered.
+func serveStream(stdin io.Reader) {
 	// Unbounded line reader: a JSON-RPC message larger than the old 1 MiB
 	// scanner buffer used to make Scan() return false and kill the server silently.
-	in := bufio.NewReaderSize(os.Stdin, 64*1024)
+	in := bufio.NewReaderSize(stdin, 64*1024)
+
+	// Requests run in goroutines, so main must wait for them on EOF: returning
+	// early killed in-flight work and silently dropped its response (a client
+	// that closes stdin, e.g. `ssh-mcp < requests.jsonl`, got zero output).
+	var inflight sync.WaitGroup
+	defer inflight.Wait()
 
 	for {
 		line, err := in.ReadBytes('\n')
 		if len(bytes.TrimSpace(line)) > 0 {
-			go serveLine(line)
+			inflight.Add(1)
+			go func(l []byte) {
+				defer inflight.Done()
+				serveLine(l)
+			}(line)
 		}
 		if err != nil {
 			if err != io.EOF {
 				debugf("stdin read error: %v", err)
 			}
+			debugf("stdin closed, draining in-flight requests")
 			return
 		}
 	}
@@ -565,12 +583,20 @@ func executeSSH(ctx context.Context, host, command, stdin, password string, maxO
 	case waitErr = <-done:
 	case <-ctx.Done():
 		timedOut = true
-		// Closing the client tears down the channel, which unblocks Wait.
-		_ = client.Close()
+		// Closing the channel alone does NOT stop the remote command: it just
+		// detaches it, leaving an orphan (verified: `sleep 60` survived). Send a
+		// real signal, escalating to SIGKILL, before tearing the session down.
+		_ = session.Signal(ssh.SIGTERM)
 		select {
 		case waitErr = <-done:
-		case <-time.After(3 * time.Second):
+		case <-time.After(2 * time.Second):
+			_ = session.Signal(ssh.SIGKILL)
+			select {
+			case waitErr = <-done:
+			case <-time.After(2 * time.Second):
+			}
 		}
+		_ = client.Close()
 	}
 
 	res := &execResult{
@@ -587,7 +613,7 @@ func executeSSH(ctx context.Context, host, command, stdin, password string, maxO
 
 	if timedOut {
 		res.ExitCode = -1
-		return res, fmt.Errorf("command timed out after %s - session killed, the remote process was sent SIGHUP", timeout)
+		return res, fmt.Errorf("command timed out after %s - remote command signalled (SIGTERM, then SIGKILL after 2s)", timeout)
 	}
 
 	if waitErr != nil {
@@ -857,9 +883,18 @@ func absLocal(p string) string {
 // parseHost resolves user@host[:port] plus ~/.ssh/config.
 func parseHost(host string) (user, addr, identityFile string) {
 	user = os.Getenv("USER")
+	if user == "" {
+		if u, err := osuser.Current(); err == nil {
+			user = u.Username
+		}
+	}
+	// An explicit user@ in the host argument outranks User from ssh config,
+	// exactly like the ssh(1) command line.
+	explicitUser := false
 	rest := host
 	if at := strings.LastIndex(rest, "@"); at != -1 {
 		user = rest[:at]
+		explicitUser = true
 		rest = rest[at+1:]
 	}
 
@@ -871,7 +906,7 @@ func parseHost(host string) (user, addr, identityFile string) {
 	alias := rest
 	if home, err := os.UserHomeDir(); err == nil {
 		if cfg := loadSSHConfig(home); cfg != nil {
-			if v, _ := cfg.Get(rest, "User"); v != "" {
+			if v, _ := cfg.Get(rest, "User"); v != "" && !explicitUser {
 				user = v
 			}
 			if hn, _ := cfg.Get(rest, "HostName"); hn != "" {
